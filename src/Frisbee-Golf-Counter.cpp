@@ -16,17 +16,16 @@
 *   This software will work with both pressure and PIR sensor counters
 */
 
-//v1 - Adapted from the Visitation Counters Code at release v11.06
+//v1    - Adapted from the Visitation Counters Code at release v11.06
+//v1.01 - Working on interrupt driven alerts
+//v1.02 - Added polling back in as well
 
 
 // Particle Product definitions
 void setup();
 void loop();
-void printAccelGraph(float value, String name, int numBarsFull, float rangeAbs);
-void sensorControl(bool enableSensor);
 void recordCount();
 void sendEvent();
-void publishToGoogleSheets();
 void UbidotsHandler(const char *event, const char *data);
 void takeMeasurements();
 bool isItSafeToCharge();
@@ -46,7 +45,6 @@ int hardResetNow(String command);
 int sendNow(String command);
 void resetEverything();
 int setSolarMode(String command);
-int setSensorType(String command);
 int setVerboseMode(String command);
 String batteryContextMessage();
 int setOpenTime(String command);
@@ -56,11 +54,11 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 17 "/Users/chipmc/Documents/Maker/Particle/Projects/Frisbee-Golf-Counter/src/Frisbee-Golf-Counter.ino"
+#line 19 "/Users/chipmc/Documents/Maker/Particle/Projects/Frisbee-Golf-Counter/src/Frisbee-Golf-Counter.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(1);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] ="1.00";
+char currentPointRelease[6] ="1.02";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -93,10 +91,10 @@ std::atomic<uint32_t> dailyAtomic;
 #include "3rdGenDevicePinoutdoc.h"                  // Pinout Documentation File
 #include "AB1805_RK.h"                              // Watchdog and Real Time Clock - https://github.com/rickkas7/AB1805_RK
 #include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
-#include "UnitTestCode.h"                           // This code will exercise the device
 #include "PublishQueueAsyncRK.h"                    // Async Particle Publish
+#include "ModMMA8452Q.h"                            // From Sparkfun library
 #include <atomic>
-#include "SparkFunMMA8452Q.h"                       // From Sparkfun library
+
 
 // Libraries with helper functionsB40TAB9228FTJVL LXUML5Y3EE3YW4X
 #include "time_zone_fn.h"
@@ -140,9 +138,7 @@ const int wakeUpPin =     D8;                       // This is the Particle Elec
 const int blueLED =       D7;                       // This LED is on the Electron itself
 const int userSwitch =    D4;                       // User switch with a pull-up resistor
 // Pin Constants - Sensor
-const int intPin =        SCK;                      // Pressure Sensor inerrupt pin
-const int disableModule = MOSI;                     // Bringining this low turns on the sensor (pull-up on sensor board)
-const int ledPower =      MISO;                     // Allows us to control the indicator LED on the sensor board
+const int intPin =        D2;                      // Accelerometer Interrupt Pin - I2
 
 // Timing Variables
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
@@ -155,8 +151,8 @@ unsigned long webhookTimeStamp = 0;                 // Webhooks...
 unsigned long resetTimeStamp = 0;                   // Resets - this keeps you from falling into a reset loop
 char currentOffsetStr[10];                          // What is our offset from UTC
 unsigned long lastReportedTime = 0;                 // Need to keep this separate from time so we know when to report
-char sensorTypeConfigStr[16];
 unsigned long connectionStartTime;
+unsigned long timeSinceILastCheckedForATap;         // Temp for polling 
 
 
 // Program Variables
@@ -195,9 +191,7 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
   
   // Pressure / PIR Module Pin Setup
-  pinMode(intPin,INPUT_PULLDOWN);                   // pressure sensor interrupt
-  pinMode(disableModule,OUTPUT);                    // Turns on the module when pulled low
-  pinMode(ledPower,OUTPUT);                         // Turn on the lights
+  pinMode(intPin,INPUT);                            // sensor interrupt
   
   digitalWrite(blueLED,HIGH);                       // Turn on the led so we can see how long the Setup() takes
 
@@ -219,7 +213,6 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Alerts",current.alertCount);
   Particle.variable("TimeOffset",currentOffsetStr);
   Particle.variable("BatteryContext",batteryContextMessage);
-  Particle.variable("SensorStatus",sensorTypeConfigStr);
 
   Particle.function("setDailyCount", setDailyCount);                          // These are the functions exposed to the mobile app and console
   Particle.function("resetCounts",resetCounts);
@@ -232,7 +225,6 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.function("Set-DSTOffset",setDSTOffset);
   Particle.function("Set-OpenTime",setOpenTime);
   Particle.function("Set-Close",setCloseTime);
-  Particle.function("Set-SensorType",setSensorType);
 
   Particle.setDisconnectOptions(CloudDisconnectOptions().graceful(true).timeout(5s));  // Don't disconnect abruptly
 
@@ -245,7 +237,10 @@ void setup()                                        // Note: Disconnected Setup(
     fram.erase();                                                     // Reset the FRAM to correct the issue
     fram.put(FRAM::versionAddr, FRAMversionNumber);                   // Put the right value in
     fram.get(FRAM::versionAddr, tempVersion);                         // See if this worked
-    if (tempVersion != FRAMversionNumber) state = ERROR_STATE;        // Device will not work without FRAM
+    if (tempVersion != FRAMversionNumber) {
+      state = ERROR_STATE;                                            // Device will not work without FRAM
+      Log.info("FRAM Test Error");
+    }
     else loadSystemDefaults();                                        // Out of the box, we need the device to be awake and connected
   }
   else {
@@ -273,7 +268,9 @@ void setup()                                        // Note: Disconnected Setup(
 	// begin can take two parameters: full-scale range, and output data rate (ODR).
 	// Full-scale range can be: SCALE_2G, SCALE_4G, or SCALE_8G (2, 4, or 8g)
 	// ODR can be: ODR_800, ODR_400, ODR_200, ODR_100, ODR_50, ODR_12, ODR_6 or ODR_1
-  accel.begin(SCALE_2G, ODR_1); // Set up accel with +/-2g range, and slowest (1Hz) ODR
+  accel.begin(SCALE_2G, ODR_100); // Set up accel with +/-2g range, and slowest (1Hz) ODR
+
+  accel.setupTapInts();                                                // Set up taps on x,y and z defaults otherwise
 
   Time.setDSTOffset(sysStatus.dstOffset);                              // Set the value from FRAM if in limits
 
@@ -291,11 +288,6 @@ void setup()                                        // Note: Disconnected Setup(
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);   // Load the offset string
 
   (sysStatus.lowPowerMode) ? strncpy(lowPowerModeStr,"Low Power",sizeof(lowPowerModeStr)) : strncpy(lowPowerModeStr,"Not Low Power",sizeof(lowPowerModeStr));
-
-  sensorControl(true);                                                // Turn on the sensors.
-
-  if (sysStatus.sensorType == 0) strncpy(sensorTypeConfigStr,"Pressure Sensor",sizeof(sensorTypeConfigStr));
-  else if (sysStatus.sensorType == 1) strncpy(sensorTypeConfigStr,"PIR Sensor",sizeof(sensorTypeConfigStr));
 
   if (System.resetReason() == RESET_REASON_PIN_RESET || System.resetReason() == RESET_REASON_USER) { // Check to see if we are starting from a pin reset or a reset in the sketch
     sysStatus.resetCount++;
@@ -339,14 +331,11 @@ void loop()
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (Time.hour() != Time.hour(lastReportedTime)) state = REPORTING_STATE;                                  // We want to report on the hour but not after bedtime
     if ((Time.hour() >= sysStatus.closeTime) || (Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
-
-    
     break;
 
   case SLEEPING_STATE: {                                              // This state is triggered once the park closes and runs until it opens
     if (state != oldState) publishStateTransition();
     detachInterrupt(intPin);                                          // Done sensing for the day
-    sensorControl(false);                                             // Turn off the sensor module for the hour
     if (current.hourlyCount) {                                        // If this number is not zero then we need to send this last count
       state = REPORTING_STATE;
       break;
@@ -367,7 +356,6 @@ void loop()
       sysStatus.closeTime = 24;
     }
     if (Time.hour() < sysStatus.closeTime && Time.hour() >= sysStatus.openTime) { // We might wake up and find it is opening time.  Park is open let's get ready for the day
-      sensorControl(true);                                             // Turn off the sensor module for the hour
       attachInterrupt(intPin, sensorISR, RISING);                      // Pressure Sensor interrupt from low to high
       stayAwake = stayAwakeLong;                                       // Keeps Boron awake after deep sleep - may not be needed
     }
@@ -472,26 +460,12 @@ void loop()
   }
   // Take care of housekeeping items here
 
-    if (accel.available())
-    {
-		// To update acceleration values from the accelerometer, call accel.read();
-        accel.read();
-		
-		// After reading, six class variables are updated: x, y, z, cx, cy, and cz.
-		// Those are the raw, 12-bit values (x, y, and z) and the calculated
-		// acceleration's in units of g (cx, cy, and cz).
-		
-		// use the printAccelGraph funciton to print the values along with a bar
-		// graph, to see their relation to eachother:
-        printAccelGraph(accel.cx, "X", 20, 2.0);
-        printAccelGraph(accel.cy, "Y", 20, 2.0);
-        printAccelGraph(accel.cz, "Z", 20, 2.0);
-        Serial.println();
-    }
+  if (sensorDetect == true) recordCount();
+  else if ((millis() - timeSinceILastCheckedForATap > 100)) {
+    timeSinceILastCheckedForATap = millis();
+    if (accel.readTap()) recordCount();
+  }
 
-
-  if (sensorDetect) recordCount();                                    // The ISR had raised the sensor flag - this will service interrupts regardless of state
-  
   ab1805.loop();                                                      // Keeps the RTC synchronized with the Boron's clock
 
   if (systemStatusWriteNeeded) {
@@ -514,112 +488,44 @@ void loop()
   }
 }
 
-// printAccelGraph prints a simple ASCII bar graph for a single accelerometer axis value.
-// Examples: 
-//	printAccelGraph(-0.1, "X", 20, 2.0) will print:
-// 		X:                    =|                     (0.1 g)
-//	printAccelGraph(1.0, "Z", 20, 2.0) will print:
-//		Z:                     |==========           (1.0 g)
-// Input:
-//	- [value]: calculated value of an accelerometer axis (e.g accel.cx, accel.cy)
-//	- [name]: name of the axis (e.g. "X", "Y", "Z")
-//	- [numBarsFull]: Maximum number of bars either right or left of 0 point.
-//	- [rangeAbs]: Absolute value of the maximum acceleration range
-void printAccelGraph(float value, String name, int numBarsFull, float rangeAbs)
-{
-	// Calculate the number of bars to fill, ignoring the sign of numBars for now.
-	int numBars = abs(value / (rangeAbs / numBarsFull));
-    
-    Serial.print(name + ": "); // Print the axis name and a colon:
-	
-	// Do the negative half of the graph first:
-    for (int i=0; i<numBarsFull; i++)
-    {
-        if (value < 0) // If the value is negative
-        {
-			// If our position in the graph is in the range we want to graph
-            if (i >= (numBarsFull - numBars))
-                Serial.print('='); // Print an '='
-            else
-                Serial.print(' '); // print spaces otherwise
-        }
-        else // If our value is positive, just print spaces
-            Serial.print(' ');
-    }
-    
-    Serial.print('|'); // Print a pipe (|) to represent the 0-point
-    
-	// Do the positive half of the graph last:
-    for (int i=0; i<numBarsFull; i++)
-    {
-        if (value > 0)
-        {	// If our position in the graph is in the range we want to graph
-            if (i <= numBars)
-                Serial.print('='); // Print an '='
-            else
-                Serial.print(' '); // otherwise print spaces
-        }
-        else // If value is negative, just print spaces
-            Serial.print(' ');
-    }
-    
-	// To end the line, print the actual value:
-    Serial.println(" (" + String(value, 2) + " g)");
-}
-
-
-void sensorControl(bool enableSensor) {                               // What is the sensor type - 0-Pressure Sensor, 1-PIR Sensor
-
-  if (enableSensor) {
-    digitalWrite(disableModule,false);                                // Enable or disable the sensor
-
-    if (sysStatus.sensorType == 0) {                                  // This is the pressure sensor and we are enabling it
-        digitalWrite(ledPower,HIGH);                                  // For the pressure sensor, this is how you activate it
-    }
-    else {
-        digitalWrite(ledPower,LOW);                                   // Turns on the LED on the PIR sensor board
-    }
-  }
-
-  else { 
-    digitalWrite(disableModule,true);
-
-    if (sysStatus.sensorType == 0) {                                  // This is the pressure sensor and we are enabling it
-        digitalWrite(ledPower,LOW);                                   // Turns off the LED on the pressure sensor board
-    }
-    else {
-        digitalWrite(ledPower,HIGH);                                  // Turns off the LED on the PIR sensor board
-    }
-  }
-
-}
-
 
 void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the device
 {
   static byte currentMinutePeriod;                                    // Current minute
+  static unsigned long tapDebounceLast;                               // when did we last record a count
+  unsigned long tapDebounceTime = 1000;                                         // debounce for at least one second
 
-  pinSetFast(blueLED);                                                // Turn on the blue LED
-  countSignalTimer.reset();                                           // Keep the LED on for a set time so we can see it.
+  if (millis() - tapDebounceLast > tapDebounceTime) {
+    tapDebounceLast = millis();
 
+    pinSetFast(blueLED);                                                // Turn on the blue LED
+    countSignalTimer.reset();                                           // Keep the LED on for a set time so we can see it.
 
-  if (currentMinutePeriod != Time.minute()) {                         // Done counting for the last minute
-    currentMinutePeriod = Time.minute();                              // Reset period
-    current.maxMinValue = 1;                                          // Reset for the new minute
+    if (currentMinutePeriod != Time.minute()) {                         // Done counting for the last minute
+      currentMinutePeriod = Time.minute();                              // Reset period
+      current.maxMinValue = 1;                                          // Reset for the new minute
+    }
+    current.maxMinValue++;
+
+    current.lastCountTime = Time.now();
+    current.hourlyCount++;                                              // Increment the PersonCount
+    current.dailyCount++;                                               // Increment the PersonCount
+    if (sysStatus.verboseMode && Particle.connected()) {
+      char data[256];                                                   // Store the date in this character array - not global
+      snprintf(data, sizeof(data), "Count, hourly: %i, daily: %i",current.hourlyCount,current.dailyCount);
+      publishQueue.publish("Count",data, PRIVATE, WITH_ACK);                      // Helpful for monitoring and calibration
+    }
+
+    currentCountsWriteNeeded = true;                                    // Write updated values to FRAM
+
   }
-  current.maxMinValue++;
 
-  current.lastCountTime = Time.now();
-  current.hourlyCount++;                                              // Increment the PersonCount
-  current.dailyCount++;                                               // Increment the PersonCount
-  if (sysStatus.verboseMode && Particle.connected()) {
-    char data[256];                                                   // Store the date in this character array - not global
-    snprintf(data, sizeof(data), "Count, hourly: %i, daily: %i",current.hourlyCount,current.dailyCount);
-    publishQueue.publish("Count",data, PRIVATE, WITH_ACK);                      // Helpful for monitoring and calibration
+  if (sensorDetect) {
+    accel.clearTapInts();
+    sensorDetect = false;                                             // Reset the flag
+    publishQueue.publish("Sensor", "Activated by Interrupt", PRIVATE);
   }
 
-  currentCountsWriteNeeded = true;                                    // Write updated values to FRAM
-  sensorDetect = false;                                               // Reset the flag
 }
 
 
@@ -638,27 +544,6 @@ void sendEvent() {
   current.hourlyCountInFlight = current.hourlyCount;                  // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
 }
 
-/**
- * @brief This function published system status information daily to a Google Sheet where I can monitor config / health for the fleet
- * 
- * @details These are values that don't need to be reported hourly and many have string values that Ubidots struggles with.  Testing this approach 
- * to see if it can give me a more consistent view of fleet health and allow me to see device configuration when it is off-line
- * 
- * @link https://docs.particle.io/datasheets/app-notes/an011-publish-to-google-sheets/ @endlink
- * 
- */
-void publishToGoogleSheets() {
-  char data[256];                                                     // Store the date in this character array - not global
-  char solarString[16];
-  char verboseString[16];
-  (sysStatus.solarPowerMode) ? strncpy(solarString,"Solar",sizeof(solarString)) : strncpy(solarString,"Utility",sizeof(solarString));
-  (sysStatus.verboseMode) ? strncpy(verboseString, "Verbose",sizeof(verboseString)) : strncpy(verboseString, "Not Verbose",sizeof(verboseString));
-
-  snprintf(data, sizeof(data), "[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%i sec\",\"%i%%\"]", solarString, lowPowerModeStr, currentOffsetStr, openTimeStr, closeTimeStr, sensorTypeConfigStr, verboseString, current.maxConnectTime, current.minBatteryLevel);
-  publishQueue.publish("GoogleSheetsExport", data, PRIVATE, WITH_ACK);
-  Log.info("published: %s", data);
-
-}
 
 void UbidotsHandler(const char *event, const char *data) {            // Looks at the response from Ubidots - Will reset Photon if no successful response
   char responseString[64];
@@ -754,14 +639,9 @@ void outOfMemoryHandler(system_event_t event, int param) {
 
 void sensorISR()
 {
-  static bool frontTireFlag = false;
-  if (frontTireFlag || sysStatus.sensorType == 1) {                   // Counts the rear tire for pressure sensors and once for PIR
-    sensorDetect = true;                                              // sets the sensor flag for the main loop
-    hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
-    dailyAtomic.fetch_add(1, std::memory_order_relaxed);
-    frontTireFlag = false;
-  }
-  else frontTireFlag = true;
+  sensorDetect = true;                                              // sets the sensor flag for the main loop
+  hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
+  dailyAtomic.fetch_add(1, std::memory_order_relaxed);
 }
 
 void countSignalTimerISR() {
@@ -822,10 +702,6 @@ void loadSystemDefaults() {                                         // Default s
   * 
   */
 void checkSystemValues() {                                          // Checks to ensure that all system values are in reasonable range 
-  if (sysStatus.sensorType > 1) {                                   // Values are 0 for Pressure and 1 for PIR
-    sysStatus.sensorType = 0;
-    strncpy(sensorTypeConfigStr,"Pressure Sensor",sizeof(sensorTypeConfigStr));
-  }
   if (sysStatus.resetCount < 0 || sysStatus.resetCount > 255) sysStatus.resetCount = 0;
   if (sysStatus.timezone < -12 || sysStatus.timezone > 12) sysStatus.timezone = -5;
   if (sysStatus.dstOffset < 0 || sysStatus.dstOffset > 2) sysStatus.dstOffset = 1;
@@ -958,7 +834,6 @@ int sendNow(String command) // Function to force sending data in current hour
 {
   if (command == "1")
   {
-    publishToGoogleSheets();                                         // Send data to Google Sheets on Product Status
     state = REPORTING_STATE;
     return 1;
   }
@@ -1006,38 +881,6 @@ int setSolarMode(String command) // Function to force sending data in current ho
   else return 0;
 }
 
-/**
- * @brief Set the Sensor Type object
- * 
- * @details Over time, we may want to develop and deploy other sensot types.  The idea of this code is to allow us to select the sensor
- * we want via the console so all devices can run the same code.
- * 
- * @param command a string equal to "0" for pressure sensor and "1" for PIR sensor.  More sensor types possible in the future.
- * 
- * @return returns 1 if successful and 0 if not.
- */
-int setSensorType(String command)                                     // Function to force sending data in current hour
-{
-  if (command == "0")
-  {
-    sysStatus.sensorType = 0;
-    strncpy(sensorTypeConfigStr,"Pressure Sensor", sizeof(sensorTypeConfigStr));
-    systemStatusWriteNeeded=true;
-    if (Particle.connected()) publishQueue.publish("Mode","Set Sensor Mode to Pressure", PRIVATE, WITH_ACK);
-    
-    return 1;
-  }
-  else if (command == "1")
-  {
-    sysStatus.sensorType = 1;
-    strncpy(sensorTypeConfigStr,"PIR Sensor", sizeof(sensorTypeConfigStr));
-    systemStatusWriteNeeded=true;
-    if (Particle.connected()) publishQueue.publish("Mode","Set Sensor Mode to PIR", PRIVATE, WITH_ACK);
-    return 1;
-  }
-
-  else return 0;
-}
 
 /**
  * @brief Turns on/off verbose mode.
@@ -1058,7 +901,6 @@ int setVerboseMode(String command) // Function to force sending data in current 
     sysStatus.verboseMode = true;
     systemStatusWriteNeeded = true;
     if (Particle.connected()) publishQueue.publish("Mode","Set Verbose Mode", PRIVATE, WITH_ACK);
-    sensorControl(true);                                    // Make sure the sensor is on and correctly configured
     return 1;
   }
   else if (command == "0")
@@ -1066,7 +908,6 @@ int setVerboseMode(String command) // Function to force sending data in current 
     sysStatus.verboseMode = false;
     systemStatusWriteNeeded = true;
     if (Particle.connected()) publishQueue.publish("Mode","Cleared Verbose Mode", PRIVATE, WITH_ACK);
-    sensorControl(true);                                      // Make sure the sensor is on and correctly configured
     return 1;
   }
   else return 0;
@@ -1249,7 +1090,6 @@ void dailyCleanup() {
     setLowPowerMode("1");
   }
 
-  publishToGoogleSheets();                                         // Send data to Google Sheets on Product Status
   resetEverything();                                               // If so, we need to Zero the counts for the new day
 
   systemStatusWriteNeeded = true;
