@@ -181,9 +181,9 @@ void MMA8452Q::setupTapInts()   // Initialize the MMA8452 registers
     //writeRegister(0x21, 0x7F);  // 1. enable single/double taps on all axes
     writeRegister(PULSE_CFG, 0x55);  // 1. single taps only on all axes
     // writeRegister(PULSE_CFG, 0x6A);  // 1. double taps only on all axes
-    writeRegister(PULSE_THSX, 0x10);  // 2. x thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
-    writeRegister(PULSE_THSY, 0x10);  // 2. y thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
-    writeRegister(PULSE_THSZ, 0x10);  // 2. z thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
+    writeRegister(PULSE_THSX, 0x01);  // 2. x thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
+    writeRegister(PULSE_THSY, 0x01);  // 2. y thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
+    writeRegister(PULSE_THSZ, 0x01);  // 2. z thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
     writeRegister(PULSE_TMLT, 0xFF);  // 3. Max time limit at 100Hz odr, this is very dependent on data rate, see the app note
     writeRegister(PULSE_LTCY, 0x64);  // 4. 1000ms (at 100Hz odr) between taps min, this also depends on the data rate
     writeRegister(PULSE_WIND, 0xFF);  // 5. 318ms (max value) between taps max
