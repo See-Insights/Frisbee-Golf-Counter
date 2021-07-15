@@ -1,5 +1,5 @@
 {
     "particle.targetPlatform": "boron",
-    "particle.targetDevice": "Frisbee001",
+    "particle.targetDevice": "Boron-Dev5",
     "cortex-debug.openocdPath": "${command:particle.getDebuggerOpenocdPath}"
 }

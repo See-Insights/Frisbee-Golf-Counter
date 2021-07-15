@@ -15,13 +15,14 @@
 //v1.02 - Added polling back in as well
 //v1.03 - Multiple fixes for connectivity
 //v1.05 - Working on getting the hardware interrupt working
+//v1.06 - Hardware interrupts
 
 
 // Particle Product definitions
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(1);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] ="1.05";
+char currentPointRelease[6] ="1.06";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -55,7 +56,7 @@ std::atomic<uint32_t> dailyAtomic;
 #include "AB1805_RK.h"                              // Watchdog and Real Time Clock - https://github.com/rickkas7/AB1805_RK
 #include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
 #include "PublishQueueAsyncRK.h"                    // Async Particle Publish
-#include "ModMMA8452Q.h"                            // From Sparkfun library
+#include "ModMMA8452Q.h"                            // Modified SparkFun library
 #include <atomic>
 
 
@@ -177,6 +178,8 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Alerts",current.alertCount);
   Particle.variable("TimeOffset",currentOffsetStr);
   Particle.variable("BatteryContext",batteryContextMessage);
+  Particle.variable("Sensitivity", sysStatus.sensitivity);
+  Particle.variable("Debounce", sysStatus.debounceSec);
 
   Particle.function("setDailyCount", setDailyCount);                          // These are the functions exposed to the mobile app and console
   Particle.function("resetCounts",resetCounts);
@@ -189,6 +192,9 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.function("Set-DSTOffset",setDSTOffset);
   Particle.function("Set-OpenTime",setOpenTime);
   Particle.function("Set-Close",setCloseTime);
+  Particle.function("Set-Sensitivity", setSensitivity);
+  Particle.function("Set-Debounce", setDebounceSec);
+  
 
   Particle.setDisconnectOptions(CloudDisconnectOptions().graceful(true).timeout(5s));  // Don't disconnect abruptly
 
@@ -236,7 +242,7 @@ void setup()                                        // Note: Disconnected Setup(
 	// ODR can be: ODR_800, ODR_400, ODR_200, ODR_100, ODR_50, ODR_12, ODR_6 or ODR_1
   accel.begin(SCALE_2G, ODR_100); // Set up accel with +/-2g range, and 100Hz ODR
 
-  accel.setupTapInts();                                                // Set up taps on x,y and z defaults otherwise
+    accel.setupTapInts(sysStatus.sensitivity);                          // Initialize the accelerometer
 
   (sysStatus.lowPowerMode) ? strncpy(lowPowerModeStr,"Low Power",sizeof(lowPowerModeStr)) : strncpy(lowPowerModeStr,"Not Low Power",sizeof(lowPowerModeStr));
 
@@ -465,26 +471,8 @@ void loop()
   }
   // Take care of housekeeping items here
 
-  if (sensorDetect == true) {
-    publishQueue.publish("Interrupt", "Int Pin when high", PRIVATE);      // Diagnostic
+  if (sensorDetect) {
     recordCount();
-  }
-  else if ((millis() - timeSinceILastCheckedForATap > 100)) {
-    timeSinceILastCheckedForATap = millis();
-
-    if (accel.readTap()) {
-      char pinMessage[64];
-      snprintf(pinMessage, sizeof(pinMessage), "Before - D2 is %s and D3 is %s", (digitalRead(intPin)) ? "High" : "Low", (digitalRead(int2Pin) ? "High": "Low"));
-    
-      publishQueue.publish("Pin State", pinMessage, PRIVATE);
-      recordCount();
-      publishQueue.publish("Register", "Tap detected via i2c", PRIVATE);      // Diagnostic
-      snprintf(pinMessage, sizeof(pinMessage), "After - D2 is %s and D3 is %s", (digitalRead(intPin)) ? "High" : "Low", (digitalRead(int2Pin) ? "High": "Low"));
-    
-      publishQueue.publish("Pin State", pinMessage, PRIVATE);
-
-
-    }
   }
 
   ab1805.loop();                                                      // Keeps the RTC synchronized with the Boron's clock
@@ -514,9 +502,8 @@ void recordCount() // This is where we check to see if an interrupt is set when 
 {
   static byte currentMinutePeriod;                                    // Current minute
   static unsigned long tapDebounceLast;                               // when did we last record a count
-  unsigned long tapDebounceTime = 1000;                                         // debounce for at least one second
 
-  if (millis() - tapDebounceLast > tapDebounceTime) {
+  if (millis() - tapDebounceLast > sysStatus.debounceSec * 1000) {
     tapDebounceLast = millis();
 
     pinSetFast(blueLED);                                                // Turn on the blue LED
@@ -544,7 +531,6 @@ void recordCount() // This is where we check to see if an interrupt is set when 
   if (sensorDetect) {
     accel.clearTapInts();
     sensorDetect = false;                                             // Reset the flag
-    publishQueue.publish("Sensor", "Activated by Interrupt", PRIVATE);
   }
 
 }
@@ -972,6 +958,51 @@ int setDailyCount(String command)
   currentCountsWriteNeeded = true;                          // Store the new value in FRAMwrite8
   snprintf(data, sizeof(data), "Daily count set to %i",current.dailyCount);
   if (sysStatus.connectedStatus) publishQueue.publish("Daily",data, PRIVATE, WITH_ACK);
+  return 1;
+}
+
+/**
+ * @brief Sets the sensitivity of the detector.
+ * 
+ * @details Extracts the integer from the string passed in and re-initializes the accelerometer with the sensitivity value passed
+ *
+ * @param Looking for a sensitivity level from 0 - not sensitive to 10 - very sensitive
+ * 
+ * @return 1 if able to successfully take action, 0 if invalid command
+ */
+int setSensitivity(String command)
+{
+  char * pEND;
+  char data[256];
+  int tempValue = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
+  if ((tempValue < 0) || (tempValue > 10)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  sysStatus.sensitivity = tempValue;
+    accel.setupTapInts(sysStatus.sensitivity);                           // Initialize the accelerometer
+  systemStatusWriteNeeded = true;                          // Store the new value in FRAMwrite8
+  snprintf(data, sizeof(data), "Sensitivity set to %i",sysStatus.sensitivity);
+  if (sysStatus.connectedStatus) publishQueue.publish("Time",data, PRIVATE, WITH_ACK);
+  return 1;
+}
+
+/**
+ * @brief Sets the debounce delay between "Taps".
+ * 
+ * @details Extracts the integer from the string passed in and updates the debounce value
+ *
+ * @param Looking for a value from 0 to 60 seconds
+ * 
+ * @return 1 if able to successfully take action, 0 if invalid command
+ */
+int setDebounceSec(String command)
+{
+  char * pEND;
+  char data[256];
+  int tempValue = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
+  if ((tempValue < 0) || (tempValue > 60)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  sysStatus.debounceSec = tempValue;
+  systemStatusWriteNeeded = true;                          // Store the new value in FRAMwrite8
+  snprintf(data, sizeof(data), "Debounce set to %i seconds",sysStatus.debounceSec);
+  if (sysStatus.connectedStatus) publishQueue.publish("Time",data, PRIVATE, WITH_ACK);
   return 1;
 }
 

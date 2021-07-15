@@ -20,7 +20,9 @@ struct systemStatus_structure {
   unsigned long lastHookResponse;                   // Last time we got a valid Webhook response
   unsigned long lastConnection;                     // Last time we successfully connected to Particle
   uint16_t lastConnectionDuration;                  // How long - in seconds - did it take to last connect to the Particle cloud
-  uint8_t sensorType;                               // What is the sensor type - 0-Pressure Sensor, 1-PIR Sensor
+  uint8_t sensorType;                               // What is the sensor type - 0-Pressure Sensor, 1-PIR Sensor, 2-Accelerometer
+  uint8_t sensitivity;                              // Value from 0 (least sensitive) to 10 (most sensitive)
+  uint8_t debounceSec;                              // How long before we make another count
 };
 
 extern struct systemStatus_structure sysStatus;
