@@ -16,13 +16,15 @@
 //v1.03 - Multiple fixes for connectivity
 //v1.05 - Working on getting the hardware interrupt working
 //v1.06 - Hardware interrupts
+//v1.07 - Fixed issue with sensitivity and debounce variable readings
+//v2.00 - Issues with multiple hourly reporting and sleep / debounce interference, need to detach interrupt with sleep
 
 
 // Particle Product definitions
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(1);
+PRODUCT_VERSION(2);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] ="1.06";
+char currentPointRelease[6] ="2.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -128,6 +130,8 @@ char batteryContextStr[16];                         // Tracks the battery contex
 char lowPowerModeStr[16];                           // In low power mode?
 char openTimeStr[8]="NA";                           // Park Open Time
 char closeTimeStr[8]="NA";                          // Park close Time
+char debounceStr[8]="NA";
+char sensitivityStr[8]="NA";
 bool systemStatusWriteNeeded = false;               // Keep track of when we need to write
 bool currentCountsWriteNeeded = false;
 bool particleConnectionNeeded = false;              // Need to connect to Particle
@@ -178,8 +182,8 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Alerts",current.alertCount);
   Particle.variable("TimeOffset",currentOffsetStr);
   Particle.variable("BatteryContext",batteryContextMessage);
-  Particle.variable("Sensitivity", sysStatus.sensitivity);
-  Particle.variable("Debounce", sysStatus.debounceSec);
+  Particle.variable("Sensitivity", sensitivityStr);
+  Particle.variable("Debounce", debounceStr);
 
   Particle.function("setDailyCount", setDailyCount);                          // These are the functions exposed to the mobile app and console
   Particle.function("resetCounts",resetCounts);
@@ -242,7 +246,9 @@ void setup()                                        // Note: Disconnected Setup(
 	// ODR can be: ODR_800, ODR_400, ODR_200, ODR_100, ODR_50, ODR_12, ODR_6 or ODR_1
   accel.begin(SCALE_2G, ODR_100); // Set up accel with +/-2g range, and 100Hz ODR
 
-    accel.setupTapInts(sysStatus.sensitivity);                          // Initialize the accelerometer
+  accel.setupTapInts(sysStatus.sensitivity);                          // Initialize the accelerometer
+
+  countSignalTimer.changePeriod(sysStatus.debounceSec*1000);           // This keeps the device awake during debounce
 
   (sysStatus.lowPowerMode) ? strncpy(lowPowerModeStr,"Low Power",sizeof(lowPowerModeStr)) : strncpy(lowPowerModeStr,"Not Low Power",sizeof(lowPowerModeStr));
 
@@ -391,9 +397,10 @@ void loop()
   case REPORTING_STATE:
     if (state != oldState) publishStateTransition();
 
+    lastReportedTime = Time.now();                                    // We are only going to try once
+
     if (!sysStatus.connectedStatus) {                                 // Asking us to report but not connected
       particleConnectionNeeded = true;                                // Set the flag to connect us to Particle
-      lastReportedTime = Time.now();                                  // We are only going to try once
       state = CONNECTING_STATE;                                       // Will send us to connecting state - and it will send us back here                                             
       break;
     }
@@ -500,11 +507,11 @@ void loop()
 
 void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the device
 {
-  static byte currentMinutePeriod;                                    // Current minute
-  static unsigned long tapDebounceLast;                               // when did we last record a count
+  static byte currentMinutePeriod;                                      // Current minute
+  static unsigned long lastTapTime;                                     // When did we last record a count?
 
-  if (millis() - tapDebounceLast > sysStatus.debounceSec * 1000) {
-    tapDebounceLast = millis();
+  if (Time.now() - lastTapTime > sysStatus.debounceSec) {
+    lastTapTime = Time.now();
 
     pinSetFast(blueLED);                                                // Turn on the blue LED
     countSignalTimer.reset();                                           // Keep the LED on for a set time so we can see it.
@@ -523,9 +530,7 @@ void recordCount() // This is where we check to see if an interrupt is set when 
       snprintf(data, sizeof(data), "Count, hourly: %i, daily: %i",current.hourlyCount,current.dailyCount);
       publishQueue.publish("Count",data, PRIVATE, WITH_ACK);                      // Helpful for monitoring and calibration
     }
-
     currentCountsWriteNeeded = true;                                    // Write updated values to FRAM
-
   }
 
   if (sensorDetect) {
@@ -546,7 +551,7 @@ void sendEvent() {
     timeStampValue = lastReportedTime;                                // This should be the beginning of the previous hour
   }
   snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"maxmin\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.hourlyCount, current.dailyCount, sysStatus.stateOfCharge, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alertCount, current.maxMinValue, sysStatus.lastConnectionDuration, timeStampValue);
-  publishQueue.publish("Ubidots-Counter-Hook-v1", data, PRIVATE, WITH_ACK);
+  publishQueue.publish("Ubidots-Counter-Hook-v1", data, PRIVATE);
   dataInFlight = true;                                                // set the data inflight flag
   current.hourlyCountInFlight = current.hourlyCount;                  // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
 }
@@ -742,6 +747,8 @@ void makeUpParkHourStrings() {
     snprintf(closeTimeStr, sizeof(closeTimeStr), "NA");
     return;
   }
+  snprintf(sensitivityStr, sizeof(sensitivityStr), "%i", sysStatus.sensitivity);
+  snprintf(debounceStr, sizeof(debounceStr), "%i sec", sysStatus.debounceSec);
     
   snprintf(openTimeStr, sizeof(openTimeStr), "%i:00", sysStatus.openTime);
   snprintf(closeTimeStr, sizeof(closeTimeStr), "%i:00", sysStatus.closeTime);
@@ -979,6 +986,7 @@ int setSensitivity(String command)
   sysStatus.sensitivity = tempValue;
     accel.setupTapInts(sysStatus.sensitivity);                           // Initialize the accelerometer
   systemStatusWriteNeeded = true;                          // Store the new value in FRAMwrite8
+  snprintf(sensitivityStr, sizeof(sensitivityStr), "%i", sysStatus.sensitivity);
   snprintf(data, sizeof(data), "Sensitivity set to %i",sysStatus.sensitivity);
   if (sysStatus.connectedStatus) publishQueue.publish("Time",data, PRIVATE, WITH_ACK);
   return 1;
@@ -989,7 +997,7 @@ int setSensitivity(String command)
  * 
  * @details Extracts the integer from the string passed in and updates the debounce value
  *
- * @param Looking for a value from 0 to 60 seconds
+ * @param Looking for a value from 0 to 60 second.  Sets the system value and changes the period of the stay awake timer
  * 
  * @return 1 if able to successfully take action, 0 if invalid command
  */
@@ -1000,7 +1008,9 @@ int setDebounceSec(String command)
   int tempValue = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
   if ((tempValue < 0) || (tempValue > 60)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   sysStatus.debounceSec = tempValue;
+  countSignalTimer.changePeriod(sysStatus.debounceSec*1000);           // This keeps the device awake during debounce
   systemStatusWriteNeeded = true;                          // Store the new value in FRAMwrite8
+  snprintf(debounceStr, sizeof(debounceStr), "%i sec", sysStatus.debounceSec);
   snprintf(data, sizeof(data), "Debounce set to %i seconds",sysStatus.debounceSec);
   if (sysStatus.connectedStatus) publishQueue.publish("Time",data, PRIVATE, WITH_ACK);
   return 1;
