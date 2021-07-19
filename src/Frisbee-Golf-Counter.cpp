@@ -24,6 +24,8 @@
 //v1.06 - Hardware interrupts
 //v1.07 - Fixed issue with sensitivity and debounce variable readings
 //v2.00 - Issues with multiple hourly reporting and sleep / debounce interference, need to detach interrupt with sleep
+//v2.01 - Added a check before napping that the intPin is not high
+//v3.00 - Update to reduce change of napping with the interrupt flag set
 
 
 // Particle Product definitions
@@ -60,11 +62,11 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 24 "/Users/chipmc/Documents/Maker/Particle/Projects/Frisbee-Golf-Counter/src/Frisbee-Golf-Counter.ino"
+#line 26 "/Users/chipmc/Documents/Maker/Particle/Projects/Frisbee-Golf-Counter/src/Frisbee-Golf-Counter.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(2);
+PRODUCT_VERSION(3);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] ="2.00";
+char currentPointRelease[6] ="3.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -89,17 +91,12 @@ struct currentCounts_structure {                    // currently 10 bytes long
   int minBatteryLevel = 100;                        // Lowest Battery level for the day
 } current;
 
-// Atomic vairables - values are set and get atomically for use with ISR
-std::atomic<uint32_t> hourlyAtomic;
-std::atomic<uint32_t> dailyAtomic;
-
 // Included Libraries
 #include "3rdGenDevicePinoutdoc.h"                  // Pinout Documentation File
 #include "AB1805_RK.h"                              // Watchdog and Real Time Clock - https://github.com/rickkas7/AB1805_RK
 #include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
 #include "PublishQueueAsyncRK.h"                    // Async Particle Publish
 #include "ModMMA8452Q.h"                            // Modified SparkFun library
-#include <atomic>
 
 
 // Libraries with helper functionsB40TAB9228FTJVL LXUML5Y3EE3YW4X
@@ -379,6 +376,7 @@ void loop()
       .gpio(userSwitch,CHANGE)
       .gpio(intPin,RISING)
       .duration(wakeInSeconds * 1000);
+    if (sensorDetect) break;                                           // Don't nap until we are done with event - one last check as interrupts can come any time.
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
     fuel.wakeup();                                                     // Make sure that the fuel gauge wakes quickly 
@@ -549,12 +547,16 @@ void recordCount() // This is where we check to see if an interrupt is set when 
 {
   static byte currentMinutePeriod;                                      // Current minute
   static unsigned long lastTapTime;                                     // When did we last record a count?
+  char data[64];                                                   // Store the date in this character array - not global
+
 
   if (Time.now() - lastTapTime > sysStatus.debounceSec) {
     lastTapTime = Time.now();
 
-    pinSetFast(blueLED);                                                // Turn on the blue LED
     countSignalTimer.reset();                                           // Keep the LED on for a set time so we can see it.
+
+    //hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
+    //dailyAtomic.fetch_add(1, std::memory_order_relaxed);
 
     if (currentMinutePeriod != Time.minute()) {                         // Done counting for the last minute
       currentMinutePeriod = Time.minute();                              // Reset period
@@ -565,19 +567,19 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     current.lastCountTime = Time.now();
     current.hourlyCount++;                                              // Increment the PersonCount
     current.dailyCount++;                                               // Increment the PersonCount
-    if (sysStatus.verboseMode && sysStatus.connectedStatus) {
-      char data[256];                                                   // Store the date in this character array - not global
-      snprintf(data, sizeof(data), "Count, hourly: %i, daily: %i",current.hourlyCount,current.dailyCount);
-      publishQueue.publish("Count",data, PRIVATE, WITH_ACK);                      // Helpful for monitoring and calibration
-    }
+    snprintf(data, sizeof(data), "Count, hourly: %i, daily: %i",current.hourlyCount,current.dailyCount);
+    
+    if (sysStatus.verboseMode && sysStatus.connectedStatus) publishQueue.publish("Count",data, PRIVATE);                      // Helpful for monitoring and calibration
+    Log.info(data);
     currentCountsWriteNeeded = true;                                    // Write updated values to FRAM
   }
+  else if (!countSignalTimer.isActive()) pinResetFast(blueLED);
 
   if (sensorDetect) {
     accel.clearTapInts();
+    Log.info("Cleared Interrupt");
     sensorDetect = false;                                             // Reset the flag
   }
-
 }
 
 
@@ -692,8 +694,7 @@ void outOfMemoryHandler(system_event_t event, int param) {
 void sensorISR()
 {
   sensorDetect = true;                                              // sets the sensor flag for the main loop
-  hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
-  dailyAtomic.fetch_add(1, std::memory_order_relaxed);
+  pinSetFast(blueLED);                                                // Turn on the blue LED
 }
 
 void countSignalTimerISR() {
@@ -1103,10 +1104,8 @@ void publishStateTransition(void)
   char stateTransitionString[40];
   snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s", stateNames[oldState],stateNames[state]);
   oldState = state;
-  if (sysStatus.verboseMode) {
-    if (sysStatus.connectedStatus) publishQueue.publish("State Transition",stateTransitionString, PRIVATE, WITH_ACK);
-    Log.info(stateTransitionString);
-  }
+  if (sysStatus.verboseMode && sysStatus.connectedStatus) publishQueue.publish("State Transition",stateTransitionString, PRIVATE, WITH_ACK);
+  Log.info(stateTransitionString);
 }
 
 /**
