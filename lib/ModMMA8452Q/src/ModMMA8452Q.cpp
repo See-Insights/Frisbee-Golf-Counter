@@ -175,7 +175,7 @@ void MMA8452Q::setupTap(byte xThs, byte yThs, byte zThs, byte timeLimit, byte la
 	active();
 }
 
-void MMA8452Q::setupTapInts(byte sensitivity)   // Initialize the MMA8452 registers and update sensitivity
+void MMA8452Q::setupTapIntsLatch(byte sensitivity)   // Initialize the MMA8452 registers and update sensitivity
 {
 	byte interruptThreshold = 0x01;
 
@@ -199,14 +199,58 @@ void MMA8452Q::setupTapInts(byte sensitivity)   // Initialize the MMA8452 regist
    4. Set the pulse latency - the minimum required time between one pulse and the next
    5. Set the second pulse window - maximum allowed time between end of latency and start of second pulse
    for more info check out this app note: http://cache.freescale.com/files/sensors/doc/app_note/AN4072.pdf */
-  //writeRegister(0x21, 0x7F);  // 1. enable single/double taps on all axes
-  writeRegister(PULSE_CFG, 0x55);  // 1. single taps only on all axes
-  // writeRegister(PULSE_CFG, 0x6A);  // 1. double taps only on all axes
+  //writeRegister(0x21, 0x7F);  // 1. enable single/double taps on all axes - with Latch
+  writeRegister(PULSE_CFG, 0x55);  // 1. single taps only on all axes - with Latch
+  // writeRegister(PULSE_CFG, 0x6A);  // 1. double taps only on all axes - with Latch
   writeRegister(PULSE_THSX, interruptThreshold);  // 2. x thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
   writeRegister(PULSE_THSY, interruptThreshold);  // 2. y thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
   writeRegister(PULSE_THSZ, interruptThreshold);  // 2. z thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
   writeRegister(PULSE_TMLT, 0xFF);  // 3. Max time limit at 100Hz odr, this is very dependent on data rate, see the app note
   writeRegister(PULSE_LTCY, 0x64);  // 4. 1000ms (at 100Hz odr) between taps min, this also depends on the data rate
+  writeRegister(PULSE_WIND, 0xFF);  // 5. 318ms (max value) between taps max
+
+  // Set up interrupt 2 for single and double tap interrupts
+	writeRegister(CTRL_REG3, 0x02);  // Active high, push-pull interrupts
+  writeRegister(CTRL_REG4, 0x08);  // Tap ints enabled
+  writeRegister(CTRL_REG5, 0x08);  // Taps on INT2
+
+  active();  // Set to active to start reading
+}
+
+void MMA8452Q::setupTapIntsPulse(byte sensitivity)   // Initialize the MMA8452 registers and update sensitivity
+{
+	byte interruptThreshold = 0x01;
+
+  // See the many application notes for more info on setting all of these registers:
+  // http://www.freescale.com/webapp/sps/site/prod_summary.jsp?code=MMA8452Q
+  // Feel free to modify any values, these are settings that work well for me.
+
+	// Sensititivity goes from 1 (least) to 10 (most)
+	sensitivity = constrain(sensitivity,0x01,0x0A);
+
+	sensitivity *= 12.7;																	// Convert to range from 1-127;
+
+	interruptThreshold = map(sensitivity , 0x01, 0x7F, 0x10, 0x01);			// Map and compress the threshold
+
+  standby();  // Must be in standby to change registers
+
+  /* Set up single and double tap - 5 steps:
+   1. Set up single and/or double tap detection on each axis individually.
+   2. Set the accelThreshold - minimum required acceleration to cause a tap.
+   3. Set the time limit - the maximum time that a tap can be above the accelThreshold
+   4. Set the pulse latency - the minimum required time between one pulse and the next
+   5. Set the second pulse window - maximum allowed time between end of latency and start of second pulse
+   for more info check out this app note: http://cache.freescale.com/files/sensors/doc/app_note/AN4072.pdf */
+  //writeRegister(PULSE_CFG, 0x3F);  // 1. enable single/double taps on all axes - without latch
+  writeRegister(PULSE_CFG, 0x15);  // 1. single taps only on all axes - without latch
+  // writeRegister(PULSE_CFG, 0x2A);  // 1. double taps only on all axes - without latch
+  writeRegister(PULSE_THSX, interruptThreshold);  // 2. x thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
+  writeRegister(PULSE_THSY, interruptThreshold);  // 2. y thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
+  writeRegister(PULSE_THSZ, interruptThreshold);  // 2. z thresh from 0 to 127, multiply the value by 0.0625g/LSB to get the accelThreshold
+  writeRegister(PULSE_TMLT, 0xFF);  // 3. Max time limit at 100Hz odr, this is very dependent on data rate, see the app note
+  //writeRegister(PULSE_LTCY, 0x64);  // 4. 1000ms (at 100Hz odr) between taps min, this also depends on the data rate
+  writeRegister(PULSE_LTCY, 0xFF);  // 4. max time between taps
+  
   writeRegister(PULSE_WIND, 0xFF);  // 5. 318ms (max value) between taps max
 
   // Set up interrupt 2 for single and double tap interrupts

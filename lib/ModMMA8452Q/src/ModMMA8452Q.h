@@ -115,7 +115,10 @@ public:
 
 	void setupTap(byte xThs, byte yThs, byte zThs, byte timeLimit = 0xFF, byte latency = 0xFF, byte window = 0xFF);
 
-	void setupTapInts(byte sensitivity=1);
+	// Here we offer two ways to configure interrupts for taps - with and without latch
+	// The Pulse interrupts clear themselves and are recommended when you are using interrupts and sleep
+	void setupTapIntsLatch(byte sensitivity=1);
+	void setupTapIntsPulse(byte sensitivity=1);
 	void clearTapInts();
 
 

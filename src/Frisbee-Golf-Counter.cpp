@@ -26,7 +26,13 @@
 //v2.00 - Issues with multiple hourly reporting and sleep / debounce interference, need to detach interrupt with sleep
 //v2.01 - Added a check before napping that the intPin is not high
 //v3.00 - Update to reduce change of napping with the interrupt flag set
-
+//v3.01 - Still more safeguards needed
+//v4.00 - One more check and will put into use
+//v5.00 - Changed record count to include a debounce on the interrupt for stability
+//v6.00 - Trying to make it less likely that the devices get hung up
+//v7.00 - We will need to periodically wake and make sure the device has cleared the interrupt: https://community.particle.io/t/how-is-this-possible-frustrations-with-i2c-interrupts-and-sleep/60875/11
+//v8.00 - Still leaving in the periodic wakes but moving to a pulse interrupt not latching
+//v9.00 - Too many resets - reactivating the watchdog
 
 // Particle Product definitions
 void setup();
@@ -62,11 +68,11 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 26 "/Users/chipmc/Documents/Maker/Particle/Projects/Frisbee-Golf-Counter/src/Frisbee-Golf-Counter.ino"
+#line 32 "/Users/chipmc/Documents/Maker/Particle/Projects/Frisbee-Golf-Counter/src/Frisbee-Golf-Counter.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(3);
+PRODUCT_VERSION(9);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] ="3.00";
+char currentPointRelease[6] ="9.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -98,7 +104,6 @@ struct currentCounts_structure {                    // currently 10 bytes long
 #include "PublishQueueAsyncRK.h"                    // Async Particle Publish
 #include "ModMMA8452Q.h"                            // Modified SparkFun library
 
-
 // Libraries with helper functionsB40TAB9228FTJVL LXUML5Y3EE3YW4X
 #include "time_zone_fn.h"
 #include "sys_status.h"
@@ -123,7 +128,7 @@ FuelGauge fuel;                                     // Enable the fuel gauge API
 MMA8452Q accel;                                     // Default constructor, SA0 pin is HIGH
 
 // For monitoring / debugging, you can uncomment the next line
-SerialLogHandler logHandler(LOG_LEVEL_ALL);
+SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // State Maching Variables
 enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, CONNECTING_STATE, REPORTING_STATE, RESP_WAIT_STATE};
@@ -142,7 +147,6 @@ const int blueLED =       D7;                       // This LED is on the Electr
 const int userSwitch =    D4;                       // User switch with a pull-up resistor
 // Pin Constants - Sensor
 const int intPin =        D2;                      // Accelerometer Interrupt Pin - I2
-const int int2Pin =       D3;                       // Need to check both
 
 // Timing Variables
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
@@ -236,7 +240,6 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.function("Set-Sensitivity", setSensitivity);
   Particle.function("Set-Debounce", setDebounceSec);
   
-
   Particle.setDisconnectOptions(CloudDisconnectOptions().graceful(true).timeout(5s));  // Don't disconnect abruptly
 
   // Load FRAM and reset variables to their correct values
@@ -283,13 +286,19 @@ void setup()                                        // Note: Disconnected Setup(
 	// ODR can be: ODR_800, ODR_400, ODR_200, ODR_100, ODR_50, ODR_12, ODR_6 or ODR_1
   accel.begin(SCALE_2G, ODR_100); // Set up accel with +/-2g range, and 100Hz ODR
 
-  accel.setupTapInts(sysStatus.sensitivity);                          // Initialize the accelerometer
+  accel.setupTapIntsPulse(sysStatus.sensitivity);                          // Initialize the accelerometer
 
   countSignalTimer.changePeriod(sysStatus.debounceSec*1000);           // This keeps the device awake during debounce
 
   (sysStatus.lowPowerMode) ? strncpy(lowPowerModeStr,"Low Power",sizeof(lowPowerModeStr)) : strncpy(lowPowerModeStr,"Not Low Power",sizeof(lowPowerModeStr));
 
-  if (System.resetReason() == RESET_REASON_PIN_RESET || System.resetReason() == RESET_REASON_USER) { // Check to see if we are starting from a pin reset or a reset in the sketch
+  if (System.resetReason() == RESET_REASON_PIN_RESET) {
+    Log.info("Restarted due to a pin reset");
+    sysStatus.resetCount++;
+    systemStatusWriteNeeded = true;                                    // If so, store incremented number - watchdog must have done This    
+  }
+  else if (System.resetReason() == RESET_REASON_USER) { // Check to see if we are starting from a pin reset or a reset in the sketch
+    Log.info("Restarted due to a user reset");
     sysStatus.resetCount++;
     systemStatusWriteNeeded = true;                                    // If so, store incremented number - watchdog must have done This
   }
@@ -320,6 +329,7 @@ void setup()                                        // Note: Disconnected Setup(
 
   if (state == INITIALIZATION_STATE) state = IDLE_STATE;              // IDLE unless otherwise from above code
 
+  Log.info("Startup Complete");
   digitalWrite(blueLED,LOW);                                          // Signal the end of startup
 }
 
@@ -351,13 +361,17 @@ void loop()
       .duration(wakeInSeconds * 1000);
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep device reboots from here   
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
-    fuel.wakeup();                                                     // Make sure that the fuel gauge wakes quickly 
-    fuel.quickStart();
-    if (result.wakeupPin() == userSwitch) {                            // If the user woke the device we need to get up
-      setLowPowerMode("0");
-      sysStatus.openTime = 0;
-      sysStatus.closeTime = 24;
+    if (result.wakeupReason() == SystemSleepWakeupReason::BY_GPIO) {   // Awoken by GPIO pin
+      if (result.wakeupPin() == intPin) {                              // Executions starts here after sleep - time or sensor interrupt?
+        stayAwakeTimeStamp = millis();
+      }
+      else if (result.wakeupPin() == userSwitch) {
+        setLowPowerMode("0");
+        sysStatus.openTime = 0;
+        sysStatus.closeTime = 24;
+      }
     }
+
     if (Time.hour() < sysStatus.closeTime && Time.hour() >= sysStatus.openTime) { // We might wake up and find it is opening time.  Park is open let's get ready for the day
       attachInterrupt(intPin, sensorISR, RISING);                      // Pressure Sensor interrupt from low to high
       stayAwake = stayAwakeLong;                                       // Keeps Boron awake after deep sleep - may not be needed
@@ -370,22 +384,21 @@ void loop()
     if (sensorDetect || countSignalTimer.isActive()) break;           // Don't nap until we are done with event
     if (sysStatus.connectedStatus) disconnectFromParticle();          // If we are in connected mode we need to Disconnect from Particle
     stayAwake = 1000;                                                 // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
-    ab1805.stopWDT();                                                 // If we are sleeping, we will miss petting the watchdog
-    int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+    state = IDLE_STATE;                                               // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)
       .gpio(intPin,RISING)
-      .duration(wakeInSeconds * 1000);
-    if (sensorDetect) break;                                           // Don't nap until we are done with event - one last check as interrupts can come any time.
+      .duration(60 * 1000);                                            // Only nap for one minute so we can check for a stuck interrupt
+    ab1805.stopWDT();
+    if (pinReadFast(intPin)) recordCount();
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
-    ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
-    fuel.wakeup();                                                     // Make sure that the fuel gauge wakes quickly 
-    fuel.quickStart();
-    if (result.wakeupPin() == intPin) {                                // Executions starts here after sleep - time or sensor interrupt?
-      stayAwakeTimeStamp = millis();
+    ab1805.resumeWDT();
+    if (result.wakeupReason() == SystemSleepWakeupReason::BY_GPIO) {   // Awoken by GPIO pin
+      if (result.wakeupPin() == intPin) {                              // Executions starts here after sleep - time or sensor interrupt?
+        stayAwakeTimeStamp = millis();
+      }
+      else if (result.wakeupPin() == userSwitch) setLowPowerMode("0");
     }
-    else if (result.wakeupPin() == userSwitch) setLowPowerMode("0");
-    state = IDLE_STATE;                                               // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     } break;
 
   case CONNECTING_STATE:{
@@ -531,14 +544,14 @@ void loop()
     currentCountsWriteNeeded = false;
   }
 
-  if (outOfMemory >= 0) {                                             // In this function we are going to reset the system if there is an out of memory error
+  if (outOfMemory >= 0) {                                               // In this function we are going to reset the system if there is an out of memory error
     char message[64];
     snprintf(message, sizeof(message), "Out of memory occurred size=%d",outOfMemory);
     Log.info(message);
     delay(100);
-    publishQueue.publish("Memory",message,PRIVATE);                   // Publish to the console - this is important so we will not filter on verboseMod
+    publishQueue.publish("Memory",message,PRIVATE);                     // Publish to the console - this is important so we will not filter on verboseMod
     delay(2000);
-    System.reset();                                                   // An out of memory condition occurred - reset device.
+    System.reset();                                                     // An out of memory condition occurred - reset device.
   }
 }
 
@@ -547,16 +560,20 @@ void recordCount() // This is where we check to see if an interrupt is set when 
 {
   static byte currentMinutePeriod;                                      // Current minute
   static unsigned long lastTapTime;                                     // When did we last record a count?
-  char data[64];                                                   // Store the date in this character array - not global
+  char data[64];                                                        // Store the date in this character array - not global
 
+  if (sensorDetect) {
+    detachInterrupt(intPin);
+    Log.info("Cleared Interrupt");
+    sensorDetect = false;                                               // Reset the flag
+    delay(1000);                                                        // Reset as there can be "ringing"
+    attachInterrupt(intPin, sensorISR, RISING);                         // Sensor interrupt from low to high
+  }
 
   if (Time.now() - lastTapTime > sysStatus.debounceSec) {
     lastTapTime = Time.now();
 
     countSignalTimer.reset();                                           // Keep the LED on for a set time so we can see it.
-
-    //hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
-    //dailyAtomic.fetch_add(1, std::memory_order_relaxed);
 
     if (currentMinutePeriod != Time.minute()) {                         // Done counting for the last minute
       currentMinutePeriod = Time.minute();                              // Reset period
@@ -574,12 +591,6 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     currentCountsWriteNeeded = true;                                    // Write updated values to FRAM
   }
   else if (!countSignalTimer.isActive()) pinResetFast(blueLED);
-
-  if (sensorDetect) {
-    accel.clearTapInts();
-    Log.info("Cleared Interrupt");
-    sensorDetect = false;                                             // Reset the flag
-  }
 }
 
 
@@ -737,7 +748,7 @@ void loadSystemDefaults() {                                         // Default s
   sysStatus.verboseMode = false;
   sysStatus.clockSet = false;
   sysStatus.lowBatteryMode = false;
-  setLowPowerMode("1");
+  setLowPowerMode("0");
   sysStatus.timezone = -5;                                          // Default is East Coast Time
   sysStatus.dstOffset = 1;
   sysStatus.openTime = 6;
@@ -1025,7 +1036,7 @@ int setSensitivity(String command)
   int tempValue = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
   if ((tempValue < 0) || (tempValue > 10)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   sysStatus.sensitivity = tempValue;
-    accel.setupTapInts(sysStatus.sensitivity);                           // Initialize the accelerometer
+    accel.setupTapIntsPulse(sysStatus.sensitivity);                           // Initialize the accelerometer
   systemStatusWriteNeeded = true;                          // Store the new value in FRAMwrite8
   snprintf(sensitivityStr, sizeof(sensitivityStr), "%i", sysStatus.sensitivity);
   snprintf(data, sizeof(data), "Sensitivity set to %i",sysStatus.sensitivity);
