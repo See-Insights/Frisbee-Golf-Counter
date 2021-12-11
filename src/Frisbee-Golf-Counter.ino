@@ -149,6 +149,8 @@ Timer countSignalTimer(1000, countSignalTimerISR, true);  // This is how we will
 
 void setup()                                        // Note: Disconnected Setup()
 {
+  delay(2000);
+  Log.info("Starting Setup");
   /* Setup is run for three reasons once we deploy a sensor:
        1) When you deploy the sensor
        2) Each hour while the device is sleeping
@@ -218,6 +220,7 @@ void setup()                                        // Note: Disconnected Setup(
     else loadSystemDefaults();                                        // Out of the box, we need the device to be awake and connected
   }
   else {
+    Log.info("loading FRAM values");
     fram.get(FRAM::systemStatusAddr,sysStatus);                       // Loads the System Status array from FRAM
     fram.get(FRAM::currentCountsAddr,current);                        // Loead the current values array from FRAM
   }
@@ -729,7 +732,10 @@ void checkSystemValues() {                                          // Checks to
   if (sysStatus.resetCount < 0 || sysStatus.resetCount > 255) sysStatus.resetCount = 0;
   if (sysStatus.timezone < -12 || sysStatus.timezone > 12) sysStatus.timezone = -5;
   if (sysStatus.dstOffset < 0 || sysStatus.dstOffset > 2) sysStatus.dstOffset = 1;
-  if (sysStatus.openTime < 0 || sysStatus.openTime > 12) sysStatus.openTime = 0;
+  if (sysStatus.openTime < 0 || sysStatus.openTime > 12) {
+    Log.info("openTime value of %i resetting to default",sysStatus.openTime);
+    sysStatus.openTime = 0; 
+  } 
   if (sysStatus.closeTime < 12 || sysStatus.closeTime > 24) sysStatus.closeTime = 24;
   if (sysStatus.lastConnectionDuration < 0 || sysStatus.lastConnectionDuration > connectMaxTimeSec) sysStatus.lastConnectionDuration = 0;
   sysStatus.solarPowerMode = true;                                  // Need to reset this value across the fleet
